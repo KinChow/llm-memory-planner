@@ -528,6 +528,14 @@ SGLang DP Attention 作为首版显式能力，不按普通 DP 处理。其 Atte
 
 PD 部署的 Prefill、Decode 池分别展示并判定显存、缓存 tokens 和上下文容量，不生成两池相加的 max-token 总数。
 
+### 11.6 已确认的 MVP 平台范围
+
+2026-07-11 方案讨论确认，MVP 只打通 NVIDIA/CUDA 路径，框架基线仍为 vLLM `v0.24.0`、SGLang `v0.5.15`。H20 是首要校准与真实机器验收平台；其他 NVIDIA GPU 仅在具有适用证据时标记为支持。
+
+P800、其他 XPU/NPU 平台、平台分支命令/镜像、XPU Graph、XCCL 显存校准以及 NVIDIA/P800 异构 PD 均延后到后续版本，不属于 MVP 交付和验收条件。此前 P800 源码与可行性审计作为未来设计输入保留，但不得被解释为 MVP 已支持。
+
+MVP 的 PD 仍保留，但 Prefill、Decode 两池均为 NVIDIA CUDA，并继续分别展示显存和 max-token 容量。导入 P800 平台配置时只做安全静态解析并返回 `unsupported platform`，阻止显存计算和可执行导出。
+
 ## 12. 下一步
 
 基于本审计，自顶向下讨论方案：
