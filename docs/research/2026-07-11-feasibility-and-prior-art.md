@@ -514,6 +514,20 @@ otherwise                                     => 可能运行，需要实测
 
 新模型只能通过产品版本更新加入。任一模型机制或必要 adapter 未支持时明确返回 `unsupported`，不使用 tensor 名称猜测、参数量乘位宽或相近模型公式进行降级估算。服务命令中引用未支持模型时仍可静态解析并保留参数，但不能进入显存计算或可执行导出。
 
+### 11.5 已确认的框架、并行和容量口径
+
+2026-07-11 方案讨论确认，首版要求显式指定框架版本，并锁定当日最新稳定 release：vLLM `v0.24.0`、SGLang `v0.5.15`。不以动态“最新版”解析已有配置，也不兼容更早 release；平台分支使用独立的已适配发行版本。
+
+“权重可放置”和“目标服务配置可启动”独立判断。服务启动必须包含目标 KV/latent/indexer/state cache pool、CUDA/XPU Graph、activation、runtime、allocator、通信和安全余量；max-token 容量在权重放置后按整个服务、每副本或调度分区、单请求三个层级展示。
+
+负载参数按用途选填。命令中存在 max context、max running requests、max batched/prefill tokens 或 chunk size 时用于目标配置校验；未显式提供时采用固定框架/平台版本的真实默认值并标注来源，无法确定默认值时经验项保持 unknown。
+
+Rank placement 不由用户编辑，而由版本化框架/平台 adapter 根据机器数量和 TP/PP/DP/EP/CP 自动生成。用户决定机器数量和具体部署形式，工具只校验该方案；首版取消最小机器数、最优拓扑和并行范围搜索。
+
+SGLang DP Attention 作为首版显式能力，不按普通 DP 处理。其 Attention 与 FFN/MoE 使用不同的组件级并行规则；有效 Attention TP、KV/cache 归属、scheduler 分区、chunked prefill 默认值和 Graph/runtime 预留均由 SGLang adapter 解析。容量按 DP Attention 调度分区分别展示，再提供请求可均衡分配前提下的服务聚合容量，单请求不能跨分区使用聚合容量。
+
+PD 部署的 Prefill、Decode 池分别展示并判定显存、缓存 tokens 和上下文容量，不生成两池相加的 max-token 总数。
+
 ## 12. 下一步
 
 基于本审计，自顶向下讨论方案：
