@@ -491,13 +491,28 @@ otherwise                                     => 可能运行，需要实测
 
 这一调整同时意味着不再建立复杂的请求时间线模拟器。首版只保留影响边界的关键配置、粗粒度生命周期和必要的运行场景类别；框架/平台校准吸收难以建模的调度与算子差异，trace 或用户预算可以覆盖经验边界。
 
-### 11.4 已确认的模型输入门槛
+### 11.4 已确认的模型支持边界
 
-2026-07-11 方案讨论确认，首版不支持仅使用 `config.json` 估算权重。`config.json` 只提供模型结构和缓存机制信息；权重放置必须基于完整、可验证的 checkpoint tensor metadata。
+2026-07-11 方案讨论最终确认，首版不支持用户自定义模型或自定义 checkpoint，也不提供用户侧 `config.json`、checkpoint metadata、Tensor Manifest 上传和离线 Manifest CLI。
 
-统一 tensor manifest 至少需要 tensor 名称、shape、物理 dtype、数据字节数、checkpoint shard 和共享/重复关系。仅知道模型参数量、标称量化位宽、checkpoint 总文件大小或 safetensors index 的 `total_size`，无法把 embedding、lm_head、普通层、共享专家和 routed experts 正确放到具体 PP/TP/EP rank，因此不足以给出“权重可放置”结论。
+业界工具中的“自定义”通常是以下较弱能力之一：
 
-这个约束简化了核心：不再维护 config-only 的组件级权重猜测和单独的低可信放置路径。标准 safetensors 可以直接解析；其他 checkpoint 和量化格式必须通过版本化 adapter 转换到同一 manifest。无法转换时阻止计算，而不是猜测。
+- APXML、liuts 等允许输入参数量、量化或自定义设备显存，使用通用公式给出粗略估算；
+- FitLLM、InferPlan 等可以解析部分 Hugging Face config，但仍依赖已知架构和启发式 overhead，不能自动证明任意新模型的多机 tensor placement；
+- llm-cal 对未知架构降级为权重文件大小，KV 和后端兼容性保持未知；
+- KVCache.ai 使用维护者审核的模型目录和固定 formula strategy，不从任意 config 自动推导新缓存机制。
+
+没有被审计项目能够从任意 checkpoint 自动、可靠地推导模型结构、TP/PP/EP/DP Attention 权重放置、cache layout 和后端兼容性。即使用户提供完整 tensor metadata，也只能证明有哪些 tensor，不能证明每个 tensor 在特定框架和平台上如何分片、复制或 repack。
+
+因此首版只支持内置、固定 repository/revision/checkpoint 且已完成以下适配和验证的模型：
+
+- 完整 checkpoint tensor metadata；
+- 模型结构和 tensor placement 规则；
+- KV/latent/indexer/state cache strategy；
+- vLLM/SGLang 及平台版本兼容性；
+- golden vectors 和真实机器验收证据。
+
+新模型只能通过产品版本更新加入。任一模型机制或必要 adapter 未支持时明确返回 `unsupported`，不使用 tensor 名称猜测、参数量乘位宽或相近模型公式进行降级估算。服务命令中引用未支持模型时仍可静态解析并保留参数，但不能进入显存计算或可执行导出。
 
 ## 12. 下一步
 
