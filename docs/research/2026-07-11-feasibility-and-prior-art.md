@@ -491,6 +491,14 @@ otherwise                                     => 可能运行，需要实测
 
 这一调整同时意味着不再建立复杂的请求时间线模拟器。首版只保留影响边界的关键配置、粗粒度生命周期和必要的运行场景类别；框架/平台校准吸收难以建模的调度与算子差异，trace 或用户预算可以覆盖经验边界。
 
+### 11.4 已确认的模型输入门槛
+
+2026-07-11 方案讨论确认，首版不支持仅使用 `config.json` 估算权重。`config.json` 只提供模型结构和缓存机制信息；权重放置必须基于完整、可验证的 checkpoint tensor metadata。
+
+统一 tensor manifest 至少需要 tensor 名称、shape、物理 dtype、数据字节数、checkpoint shard 和共享/重复关系。仅知道模型参数量、标称量化位宽、checkpoint 总文件大小或 safetensors index 的 `total_size`，无法把 embedding、lm_head、普通层、共享专家和 routed experts 正确放到具体 PP/TP/EP rank，因此不足以给出“权重可放置”结论。
+
+这个约束简化了核心：不再维护 config-only 的组件级权重猜测和单独的低可信放置路径。标准 safetensors 可以直接解析；其他 checkpoint 和量化格式必须通过版本化 adapter 转换到同一 manifest。无法转换时阻止计算，而不是猜测。
+
 ## 12. 下一步
 
 基于本审计，自顶向下讨论方案：
