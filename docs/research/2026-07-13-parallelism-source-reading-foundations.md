@@ -1,133 +1,104 @@
 # 大模型推理并行策略与源码阅读基础
 
-> 面向第一次阅读 vLLM、SGLang 等推理框架源码的工程师，建立从物理 GPU、并行坐标到显存归属的基础心智模型
+> 这是一份入门文档，面向第一次阅读 vLLM、SGLang 推理源码的工程师。
 
-本文不绑定某个框架版本，也不定义 LLM Memory Planner 的最终数据结构。文中的简化公式用于解释概念；实际模型是否支持某种并行方式、具体如何分片，仍应以目标版本的模型实现、运行时实现和测试证据为准。
+本文先讲通用概念，再说明怎样从源码确认事实。它不替代框架审计，也不承诺某个参数在所有模型、后端和版本上都可用。
 
-## 1. 先明确我们到底在研究什么
+阅读时始终抓住一个问题：一张物理设备在某个运行阶段，究竟有哪些 allocation 同时存活？显存规划器最终回答的也是这个问题。
 
-大模型推理并行策略要回答的不只是“用了几张卡”，而是以下四类问题：
+## 1. 阅读地图：一次推理服务怎样使用显存
 
-1. **执行拓扑**：启动了多少进程，每个进程绑定哪张设备，进程之间建立了哪些通信组。
-2. **模型放置**：每张卡持有哪些权重，包括 attention、FFN、expert、embedding 和输出头。
-3. **请求与缓存归属**：一个请求由哪个 scheduler 管理，KV cache 分配在哪个缓存分区和哪些物理卡上。
-4. **运行时峰值**：Prefill、Decode、CUDA Graph capture 等阶段，权重之外还有哪些 activation、通信和临时 workspace 同时存在。
-
-对于显存规划器，最终结算对象必须回到**物理设备上的 worker**：
-
-```text
-某张物理 GPU 的阶段峰值显存
-  = 该 worker 实际持有的权重
-  + 该 worker 实际管理的 KV/状态缓存
-  + 当前阶段 activation
-  + CUDA Graph 和捕获内存池
-  + collective / kernel / connector workspace
-  + runtime、allocator 和安全余量
-```
-
-TP、PP、DP、EP、CP 是描述上述归属关系的坐标或策略，不是五块可以直接相加的显存。
-
-## 2. 从单卡 Transformer 显存开始
-
-理解分布式之前，先看一张卡上通常有哪些显存项。
+先从服务生命周期看起。服务启动后并不是一直处于同一种状态，不同阶段会出现不同的显存峰值。
 
 ```mermaid
 flowchart TB
-    accTitle: 单卡推理显存组成
-    accDescr: 一张 GPU 上的推理显存由常驻权重和缓存、阶段相关临时项以及运行时保留组成
+    accTitle: 推理服务的显存生命周期
+    accDescr: 服务依次经历模型加载、运行时初始化、图捕获和稳态请求处理，每个阶段都可能形成峰值
 
-    total["单卡峰值显存"]
-    persistent["常驻项"]
-    phase["阶段相关项"]
-    runtime["运行时项"]
-    weight["模型权重"]
-    cache["KV / 状态缓存"]
-    activation["Activation"]
-    graph["CUDA Graph"]
-    workspace["Kernel / 通信 workspace"]
-    allocator["Allocator / context / reserve"]
-
-    total --> persistent
-    total --> phase
-    total --> runtime
-    persistent --> weight
-    persistent --> cache
-    phase --> activation
-    phase --> graph
-    phase --> workspace
-    runtime --> allocator
+    load_model["加载模型与初始化设备"] --> init_runtime["建立通信组与运行时"]
+    init_runtime --> profile_memory["Profile / warmup"]
+    profile_memory --> capture_graph["CUDA Graph capture"]
+    capture_graph --> serve_requests["进入服务"]
+    serve_requests --> prefill_phase["Prefill"]
+    serve_requests --> decode_phase["Decode"]
+    serve_requests --> mixed_phase["Chunked Prefill / 混合批次"]
 ```
 
-### 2.1 权重
+### 1.1 加载与初始化
 
-权重不仅是 Transformer block 中的几个大矩阵，还可能包括：
+框架创建进程、绑定设备、初始化通信库，然后加载 checkpoint。此时最明显的是权重，但还有 CUDA context、通信 buffer、量化元数据和模型初始化临时张量。
 
-- token embedding 和 `lm_head`；
-- attention 的 Q、K、V、O projection；
-- dense FFN 的 up、gate、down projection；
-- MoE router、routed experts 和 shared experts；
-- normalization、bias；
-- 量化 scale、zero point、codebook、padding 和打包元数据；
-- speculative decoding 或 MTP 的附加层。
+“权重能装下”只说明第一关通过。服务还没有为 KV cache、CUDA Graph 和请求执行留下空间。
 
-Checkpoint 总字节数是重要输入，但不能直接当成每卡权重。分布式运行时会让不同 tensor 采用不同的分片或复制规则。
+### 1.2 Profile、warmup 与 Graph capture
 
-### 2.2 KV cache 和其他状态缓存
+不少框架会先跑 dummy batch，测量非 KV 显存，再决定 KV pool 可以分到多少。启用 CUDA Graph 时，还会捕获一组 batch shape 或 token shape。
 
-自回归生成需要保存历史 token 的中间状态。标准 attention 通常保存每层的 K 和 V；其他模型还可能使用 latent cache、indexer cache、卷积状态或状态空间模型的 state cache。
+捕获过程可能同时存在旧 allocation、待固化的 graph pool 和捕获临时张量，所以启动期也会 OOM。捕获结束后，一部分内存池和静态 buffer 通常继续常驻，不能把 Graph 全部看成已经消失的临时项。
 
-以标准 KV 为教学近似，一份 token 的逻辑 payload 可写为：
+具体保留哪些 allocation，由框架版本、runner、backend 和 capture 配置决定。
+
+### 1.3 Prefill
+
+Prefill 读取 prompt，并为需要缓存的层建立初始 KV、latent 或其他模型状态。一次
+forward 可能处理很多 token，activation 和 attention workspace 往往比 Decode 大。
+
+长 prompt 不一定一次跑完。开启 chunked prefill 后，框架把它拆成多个 chunk，
+降低单次 forward 的活跃 token 数。请求完成全部 Prefill 后，完整 prompt 对应的
+缓存或状态仍要保留，所以 chunking 主要改变执行峰值，不会自动缩短最终上下文。
+
+### 1.4 Decode
+
+Decode 每步通常只为每个请求生成一个或少量 token，但要读取此前积累的 KV、
+latent cache 或模型状态。并发请求越多、历史越长，相关缓存和状态占用通常越大。
+
+Decode 常使用 CUDA Graph replay。此时不能把“Graph 显存”和“同一批 replay activation 的理论峰值”机械相加，因为 activation 可能已经放在 graph private pool 或静态 buffer 中。是否需要另加，要看测量口径。
+
+### 1.5 混合批次
+
+真实 scheduler 可能把 Decode 请求和一段 chunked prefill 放进同一 iteration。这个阶段既不是纯 Prefill，也不是纯 Decode，显存共存关系取决于 scheduler 和 runner。
+
+因此，`phase` 在规划器里应理解为一种有明确共存关系的运行状态，而不是固定的三个标签。MVP 可以先支持初始化/捕获、Prefill、Decode 和已确认的混合路径，未建模的路径要标为未知。
+
+## 2. 从物理设备理解 process、worker、rank 与 group
+
+分布式术语容易让人误以为每个并行坐标都有一份显存。实际结算必须回到物理设备。
+
+### 2.1 Device、process 和 worker
+
+| 术语 | 常见含义 | 阅读源码时要确认什么 |
+| --- | --- | --- |
+| device | GPU、XPU 等物理设备 | 哪些进程在这张设备上创建 context 和 allocation |
+| process | 操作系统进程 | 是否绑定单设备，是否只负责控制 |
+| worker | 执行模型计算的逻辑单元 | 它是进程、actor，还是进程内对象 |
+| engine | 调度和执行服务单元 | 是否拥有独立 scheduler 和 KV pool |
+| controller | 路由或控制组件 | 是否加载模型，是否占用设备显存 |
+
+常见 CUDA serving 是一张 GPU 对应一个模型 worker，但这只是常见情况。一个设备上可能有多个进程；控制进程也可能创建 CUDA context。规划器的数据结构不应把 `worker_id` 直接当作 `device_id`。
+
+物理设备账本可以写成：
 
 ```text
-KV bytes/token
-  = 本地 KV 层数
-  x 本地 KV head 数
-  x head dimension
-  x 2                    # K 和 V
-  x cache dtype bytes
+device ledger
+  device identity
+  + processes bound to this device
+  + workers owned by each process
+  + resident allocations of those processes
+  + phase-specific allocations that coexist
 ```
 
-“本地”二字很关键。PP 会改变本卡持有的层数，TP/CP/DCP 可能改变本卡持有的 KV head 或 token slice。page/block 对齐还会令实际分配量高于逻辑 payload。
+如果两个进程共享同一张卡，它们的 context、权重和运行时保留都要聚合到同一个 device ledger。最终拿这个结果与该卡实际可用显存比较。
 
-### 2.3 Activation 和临时张量
+### 2.2 Rank 是编号，不是一张额外的卡
 
-Activation 是一次 forward 中产生的中间结果，通常受以下因素共同影响：
+`rank` 是进程在某个通信域中的编号。
 
-- 当前 forward 的 token 数；
-- hidden size、intermediate size、head 数；
-- attention backend 和 kernel 融合方式；
-- TP、CP 等策略下当前 rank 实际处理的 token 或 hidden slice；
-- 是否执行 chunked prefill；
-- 是否捕获或回放 CUDA Graph。
+- `global rank` 是 distributed world 中的编号，通常在 `[0, world_size)` 内。
+- `local rank` 是当前机器上的编号，常用于选择本机设备。
+- `group rank` 是某个 process group 内的编号。
+- `tp_rank`、`pp_rank`、`dp_rank` 是并行维度上的坐标。
 
-因此，“权重能加载”不代表“服务能启动”。加载权重后剩余显存还要容纳 KV pool、Graph、activation 和 runtime workspace。
-
-## 3. 分布式运行的基础词汇
-
-### 3.1 Process、worker 与 device
-
-这些词在不同框架中并不总是严格同义，阅读源码时要看它们实际指向什么：
-
-| 术语 | 常见含义 | 阅读时要确认 |
-| --- | --- | --- |
-| process | 操作系统进程 | 是否一进程绑定一设备，还是一个控制进程管理多个 worker |
-| worker | 执行模型计算的逻辑单元 | 是进程、线程、远程 actor，还是进程内对象 |
-| device | GPU/XPU 等物理设备 | 一个 worker 是否独占设备，是否存在多进程共享 |
-| engine | 调度和执行服务单元 | 是否拥有独立 scheduler、KV pool 和请求队列 |
-| controller | 路由或控制进程 | 是否加载模型，是否占用加速卡显存 |
-
-在常见 GPU serving 路径中，可以暂时使用“一张 GPU 对应一个模型 worker”的心智模型，但源码审计必须验证这个假设。
-
-### 3.2 Rank、global rank 与 local rank
-
-`rank` 是一个进程在某个通信域中的编号。
-
-- `global rank`：在整个 distributed world 中的编号，通常范围为 `[0, world_size)`。
-- `local rank`：进程在当前机器上的本地编号，常用于选择 `CUDA_VISIBLE_DEVICES` 中的某张卡。
-- `group rank`：进程在某个 process group 内的编号。
-- `tp_rank`、`pp_rank` 等：进程在特定并行维度上的坐标。
-
-同一个进程可以同时是：
+同一个 worker 可以同时具有这些身份：
 
 ```text
 global_rank = 5
@@ -137,897 +108,554 @@ pp_rank     = 0
 dp_rank     = 1
 ```
 
-这些编号从不同角度描述同一个 worker，并不代表五个进程。
-
-### 3.3 World 与 world size
-
-`world` 是一组参加分布式通信的进程，`world_size` 是其中的进程数。
-
-要特别小心：配置中的 `TP x PP x DP` 不一定等于某段源码里的 `world_size`。某些实现把 DP 副本做成多个互相独立的 world；另一些实现把 DP 也放进一个更大的 world。只能从 launcher 和 distributed initialization 的源码确认。
-
-### 3.4 Process group
-
-Process group 是 global world 中的一组 rank，用于完成某一种协作。例如，一个 8-rank world 可以同时建立：
-
-- 若干个 TP group；
-- 若干个 PP group；
-- 一个或多个 DP group；
-- EP、CP 或 DCP group。
-
-同一 rank 可以同时属于多个 group。group 是通信关系的“视图”，不是额外 GPU。
-
-### 3.5 同一物理 rank 有多个并行坐标
-
-假设一个简化部署使用：
+它们描述的是同一个执行实体。下面的算法没有意义：
 
 ```text
-TP = 2
-PP = 2
-DP = 2
-物理 worker 数 = 2 x 2 x 2 = 8
+一张卡显存 = TP rank 显存 + PP rank 显存 + DP rank 显存
 ```
 
-一种可能的坐标映射如下：
+正确做法是让这些坐标共同决定 rank 5 持有哪些模型组件、服务哪些请求，再把 allocation 记到 rank 5 所绑定的物理设备。
 
-| global rank | DP 坐标 | PP 坐标 | TP 坐标 | 物理实体 |
-| ---: | ---: | ---: | ---: | --- |
-| 0 | 0 | 0 | 0 | GPU worker 0 |
-| 1 | 0 | 0 | 1 | GPU worker 1 |
-| 2 | 0 | 1 | 0 | GPU worker 2 |
-| 3 | 0 | 1 | 1 | GPU worker 3 |
-| 4 | 1 | 0 | 0 | GPU worker 4 |
-| 5 | 1 | 0 | 1 | GPU worker 5 |
-| 6 | 1 | 1 | 0 | GPU worker 6 |
-| 7 | 1 | 1 | 1 | GPU worker 7 |
+### 2.3 World 与 process group
 
-以 `global rank 5` 为例，它是：
+`world` 是一组完成分布式初始化的进程，`world_size` 是进程数量。不同框架对 world 的边界处理不同：普通 DP 可能形成多个独立 world，也可能进入一个更大的 world。
 
-- DP 副本 1 的成员；
-- PP stage 0 的成员；
-- TP slice 1 的成员；
-- 一张确定的物理 GPU 上的一个 worker。
-
-在这份教学布局中，它还可以同时属于：
-
-```text
-TP group = [4, 5]       # 同一 DP 副本、同一 PP stage 内协同执行一层
-PP group = [5, 7]       # 同一 DP 副本、同一 TP slice 跨 stage 传递 activation
-DP group = [1, 5]       # 两个副本中相同 PP/TP 坐标的位置
-```
-
-这三个 group 都包含 rank 5，却没有为它创造三张 GPU。假设模型的 stage 0 包含 embedding 和前半层，那么 rank 5 的放置推导是：
-
-```text
-PP 坐标 0
-  -> 只加载 stage 0 的 embedding 和前半层
-
-TP 坐标 1
-  -> 对上述组件加载 slice 1；norm 等不可分组件仍可能完整复制
-
-DP 坐标 1
-  -> 这些组件属于副本 1；请求和 KV 使用副本 1 的容量域
-
-最终
-  -> 全部结果都落到 global rank 5 对应的同一张物理 GPU 的显存账本
-```
-
-具体 group 成员和层分配只是为了展示推导方法；实际轴顺序由目标框架的 rank layout 决定。
-
-正确结算方式是：找出 rank 5 实际持有的 PP stage 0 层、这些层的 TP slice、该 DP 副本的 KV 分区，以及它的运行时项，然后得到 rank 5 的显存。
-
-错误方式是：
-
-```text
-rank 5 显存 = TP rank 显存 + PP rank 显存 + DP rank 显存
-```
-
-TP/PP/DP rank 不是三个显存容器，它们只是 rank 5 的三个坐标。
+Process group 是 world 中的一组 ranks。一个框架通常会建立 TP、PP、DP、EP 或 CP group。同一 rank 可以属于多个 group，这不会增加 worker 数。
 
 ```mermaid
-flowchart LR
-    accTitle: 一个 worker 的多维身份
-    accDescr: 同一物理 GPU worker 同时拥有 TP PP DP 等坐标，这些坐标共同决定组件和请求归属而不能作为独立显存相加
+flowchart TB
+    accTitle: 一个 worker 的多维身份与物理账本
+    accDescr: 多种并行坐标共同决定同一 worker 的模型和请求归属，显存最终聚合到物理设备
 
-    config["并行配置"] --> resolve["解析 rank 坐标与 groups"]
-    resolve --> worker["物理 GPU worker"]
-    tp["TP 坐标"] --> worker
-    pp["PP 坐标"] --> worker
-    dp["DP 坐标"] --> worker
-    ep_cp["EP / CP 坐标"] --> worker
-    worker --> placement["权重与 cache 放置"]
-    worker --> runtime["阶段 runtime 显存"]
-    placement --> ledger["该卡显存账本"]
-    runtime --> ledger
+    global_rank["global rank 5"] --> tp_coord["TP 坐标 1"]
+    global_rank --> pp_coord["PP 坐标 0"]
+    global_rank --> dp_coord["DP 坐标 1"]
+    global_rank --> worker_obj["model worker"]
+    tp_coord --> placement["tensor slice"]
+    pp_coord --> placement["本地 layers"]
+    dp_coord --> request_domain["请求与 cache 域"]
+    worker_obj --> device_obj["node 1 / local GPU 1"]
+    placement --> device_ledger["device ledger"]
+    request_domain --> device_ledger
+    device_obj --> device_ledger
 ```
 
-## 4. Collective：并行计算如何拼回完整结果
+### 2.4 Collective 是分片后的协作方式
 
-权重或 token 分到多张卡后，各 rank 需要通过 collective 通信交换数据。常见操作包括：
+权重、activation 或 token 被分开后，ranks 需要交换结果。
 
-| Collective | 直观含义 | 常见用途 | 可能的显存影响 |
-| --- | --- | --- | --- |
-| all-reduce | 各 rank 的值求和，并把结果发回所有 rank | Row Parallel partial output 汇总 | 通信 buffer、结果 tensor |
-| all-gather | 收集所有 rank 的 slice，每个 rank 得到完整结果 | hidden/token slice 拼接 | 完整 gather buffer |
-| reduce-scatter | 先规约，再让每个 rank 只保留一段 | 聚合后直接分片 | shard 输出和通信 workspace |
-| all-to-all | 每个 rank 向其他 rank 发送不同数据 | MoE token dispatch | send/receive buffer、padding |
-| broadcast | 一个 rank 向组内其他 rank 发送数据 | 参数或 metadata 同步 | 接收 buffer |
-| point-to-point | rank 间定向发送/接收 | PP stage 之间传 activation | stage boundary buffer |
+| 操作 | 直观含义 | 推理中的常见位置 |
+| --- | --- | --- |
+| all-reduce | 求和后让每个 rank 都得到结果 | Row Parallel 输出 |
+| all-gather | 收集各 rank 的 slice | 拼接 hidden 或 token slice |
+| reduce-scatter | 规约后每个 rank 只保留一段 | 分片输出 |
+| all-to-all | 每个 rank 向其他 rank 发送不同内容 | MoE token dispatch |
+| send/recv | 两个 rank 定向传输 | PP stage 边界 |
 
-Collective 的重要性有两层：
+Collective 可能需要通信 buffer 或 workspace。权重缩小了，不代表临时显存按同样比例缩小。
 
-1. 它说明“分片”并不等于没有代价，结果可能需要重新收集。
-2. 通信库和 fused kernel 可能申请持久或临时 workspace，这部分通常不能仅从 checkpoint 公式得到。
+## 3. TP、PP、DP、EP、CP 分别改变什么
 
-源码阅读不能只看模型权重 loader，还要追到 forward 中调用了何种 collective、输入 shape 多大、buffer 是否缓存复用。
+这些缩写描述放置和协作方式。理解它们时，先问“切了哪个维度”，再问“是否复用已有 workers”。
 
-## 5. Tensor Parallel：按张量维度切权重
+### 3.1 Tensor Parallel：切同一层的张量
 
-Tensor Parallel（TP）让多个 rank 协同执行同一层。最经典的解释来自矩阵乘法：
-
-```text
-Y = XW
-```
-
-### 5.1 Column Parallel Linear
-
-将权重 `W` 沿输出维切开：
+对矩阵乘法 `Y = XW`，Column Parallel 通常沿输出维切 `W`：
 
 ```text
 W = [W0 | W1]
 
 Y0 = XW0
 Y1 = XW1
-Y  = [Y0 | Y1]
 ```
 
-每个 rank 持有一部分输出列，输入 `X` 通常是完整的。局部输出也只有一部分；后续层可以继续消费这个分片，或者通过 all-gather 得到完整输出。
+每个 rank 持有一部分输出列。局部结果可以继续保持分片，也可以 all-gather。
 
-显存含义：
-
-- 大矩阵权重通常近似按 TP 减少；
-- bias 若沿输出维对应切分，也会分片；
-- 是否立即 gather 决定 activation 和通信峰值。
-
-### 5.2 Row Parallel Linear
-
-将权重 `W` 沿输入维切开，同时将输入切开：
+Row Parallel 沿输入维切 `W`，输入也分片：
 
 ```text
 W = [W0]
     [W1]
 
 X = [X0 | X1]
-
 Y = X0W0 + X1W1
 ```
 
-每个 rank 先产生局部 partial output，之后通常通过 all-reduce 得到完整 `Y`。
+局部 partial output 通常需要 all-reduce。于是权重主体会缩小，输出 tensor 和通信 buffer 却未必缩小。
 
-显存含义：
+QKV 还要考虑 GQA/MQA。假设模型有 32 个 query heads、8 个 KV heads：
 
-- 权重主体可按输入维分片；
-- 输出可能在每个 rank 上保持完整；
-- bias、partial output 和 collective buffer 不一定按 TP 缩小。
-
-### 5.3 QKV Parallel 与 GQA/MQA 复制
-
-Attention 的 Q、K、V 不能简单看成三个同样切分的矩阵。模型可能是：
-
-- MHA：query head 数和 KV head 数相同；
-- GQA：多个 query head 共享较少的 KV heads；
-- MQA：所有 query heads 共享极少量 KV head。
-
-假设一个 GQA 模型有 `32` 个 query heads、`8` 个 KV heads：
-
-| 有效 attention TP | 每 rank query heads | 每 rank KV heads | KV 是否复制 |
+| 有效 attention TP | 每 rank query heads | 常见的每 rank KV heads | 结果 |
 | ---: | ---: | ---: | --- |
-| 2 | 16 | 4 | 否 |
-| 4 | 8 | 2 | 否 |
-| 8 | 4 | 1 | 否 |
-| 16 | 2 | 至少 1 | 是，KV head 开始跨 rank 复制 |
+| 2 | 16 | 4 | Q/K/V 都能继续切 |
+| 8 | 4 | 1 | 每 rank 一个 KV head |
+| 16 | 2 | 至少 1 | KV heads 开始在 ranks 间复制 |
 
-当有效 TP 宽度超过 KV head 数，每个 rank 仍需要至少一个可用 KV head。此后继续增大 TP：
+当 TP 超过 KV head 数，K/V projection 与每 token KV payload 可能不再等比例下降。真实边界还受 divisibility、padding 和模型自定义 attention 影响。
 
-- Q projection 可能继续缩小；
-- K/V projection 不再按 TP 等比例缩小；
-- 每 token 的本地 KV cache 也可能停止下降。
+所以不能直接用 `checkpoint bytes / TP` 作为每卡权重。norm、bias、量化 scale 可能复制，embedding 和 `lm_head` 可能按 vocabulary 分片，K/V 还会遇到复制饱和。
 
-表格只表达常见布局。真实实现还受 head divisibility、padding、模型自定义 attention 和有效 attention group 影响，必须检查具体 QKV layer 构造和 loader。
+### 3.2 Pipeline Parallel：按层分 stage
 
-### 5.4 为什么“总权重 / TP”不成立
-
-即使只讨论 dense 模型，每个组件也可能不同：
-
-| 组件 | 常见放置方式 |
-| --- | --- |
-| attention Q | 按 query heads 或输出维分片 |
-| attention K/V | 按 KV heads 分片，达到 head 数后复制 |
-| attention O | 常见为 Row Parallel |
-| FFN up/gate | 常见为 Column Parallel |
-| FFN down | 常见为 Row Parallel |
-| norm | 常见为复制 |
-| embedding/lm_head | 常见为 vocabulary parallel，也可能复制或共享 |
-| quant scales | 可能分片，也可能按量化 group 复制或 padding |
-
-因此正确方法是按 tensor 或组件的 placement rule 结算，而不是对 checkpoint 总量做一次除法。
-
-## 6. Pipeline Parallel：按层切分模型
-
-Pipeline Parallel（PP）把连续或规则分配的层放到不同 stage。请求依次经过各 stage：
+PP 把模型层放到不同 stage，请求沿 stage 依次执行：
 
 ```text
-tokens
-  -> stage 0: embedding + layers 0..N
-  -> stage 1: layers N+1..M
-  -> stage 2: layers M+1..K + final norm + lm_head
-  -> logits
+stage 0: embedding + 前半层
+  -> stage 1: 后半层 + final norm + lm_head
 ```
 
-### 6.1 PP 不是 checkpoint 字节平均除法
+每个 stage 只保存本地 attention layers 的 KV。首尾 stage 还可能多出 embedding 或输出头，层数也未必能被 PP 整除。每卡权重不能用 checkpoint 平均除以 PP。
 
-不同 stage 的权重通常不完全相同：
+PP 的结论取决于最坏 stage。平均值刚好装下没有用，只要一个 stage 超出物理显存，服务就起不来。
 
-- 首 stage 可能额外持有 embedding；
-- 末 stage 可能额外持有 final norm 和 `lm_head`；
-- 层数不能整除 PP 时，各 stage 的层数不同；
-- 某些模型存在跨层共享、MTP、视觉 encoder 或特殊 block；
-- tied embedding 和 lm_head 的实际存储方式依实现而定。
+stage 之间还要发送 activation。send/recv buffer 是否复用、是否 double buffer、混合批次是否重叠，都可能改变运行峰值。
 
-每个 stage 的 KV cache 也只对应其本地 attention layers。于是同样的 KV block 数，在 layer 更多的 stage 上需要更多字节。
+### 3.3 普通 DP：复制完整服务副本
 
-### 6.2 最坏 stage 决定能否运行
-
-假设两个 PP stage 的单卡账本如下：
-
-| 项目 | Stage 0 | Stage 1 |
-| --- | ---: | ---: |
-| 权重 | 35 GiB | 31 GiB |
-| 目标 KV | 30 GiB | 30 GiB |
-| Graph/runtime | 10 GiB | 8 GiB |
-| 合计 | 75 GiB | 69 GiB |
-
-如果单卡实际可用显存是 `72 GiB`，部署仍会因为 stage 0 OOM。不能使用两个 stage 的平均值 `72 GiB` 得出“刚好能运行”。
-
-此外，一个请求需要穿过完整 pipeline。若框架要求各 stage 使用一致的逻辑 cache block 数，最紧张 stage 可能限制整个 pipeline 的 token 容量。
-
-### 6.3 PP 边界也有运行时显存
-
-stage 之间要发送 activation。需要确认：
-
-- send/receive buffer 是临时还是常驻；
-- 是否 double buffer；
-- microbatch 或并发调度如何重叠；
-- Prefill 和 Decode 的 boundary shape 是否不同。
-
-这些信息通常位于 pipeline runner、scheduler 和 communication implementation 中，而不在模型权重定义中。
-
-## 7. Data Parallel：复制服务副本并分配请求
-
-普通 Data Parallel（DP）的直观语义是复制完整模型服务：
+普通 Data Parallel 常见语义是把完整模型执行域复制多份，再把请求路由到某一份：
 
 ```text
-请求路由器
-  +-> DP replica 0: 自己的权重、scheduler、KV cache
-  +-> DP replica 1: 自己的权重、scheduler、KV cache
+router
+  -> replica 0: TP/PP workers + scheduler + KV pool
+  -> replica 1: TP/PP workers + scheduler + KV pool
 ```
 
-如果每个副本内部使用 `TP=4, PP=2`，那么一个副本可能需要 8 个模型 worker。`DP=2` 则复制两套这样的执行域。
+每个 replica 内部仍可使用 TP 和 PP。增加普通 DP 通常会增加总吞吐容量，却不会降低单副本每卡权重，也不会把单请求 KV 分摊到两个副本。
 
-### 7.1 DP 通常不会降低单请求显存
+如果两个副本各能保存 100k cached tokens，服务聚合容量接近 200k，不代表一个请求可以拥有 200k context。单请求受其所在 cache 容量域约束。
 
-增加普通 DP 的主要作用是增加服务副本和总体容量，而不是降低每卡权重：
+### 3.4 组件级 DP：只让模型的一部分按 DP 工作
 
-- 每个副本仍需持有完整模型，只是模型内部可继续使用 TP/PP；
-- 请求通常只被路由到一个 DP 副本；
-- 该请求的 KV 只占用目标副本的 cache；
-- 单请求最大上下文受单副本容量限制，不能把两个副本的空闲 KV 相加。
+有些实现中的 `DP` 不表示复制整条 forward。典型情况是 attention 与 MoE 使用不同的通信域，或者 scheduler 把请求分区后，某些组件仍在更大的 rank group 上协作。
 
-例如两个副本各自最多容纳 `100k` aggregate cached tokens：
-
-- 服务总体可能容纳约 `200k` tokens 的请求集合；
-- 单个请求不能因此拥有 `200k` context；
-- 一个副本满载、另一个空闲时，是否可迁移请求取决于框架能力，不能默认成立。
-
-### 7.2 Scheduler 是显存语义的一部分
-
-DP 不只是权重复制。请求由谁管理，会决定 KV 的容量域：
-
-- 一个 scheduler 对应一个 KV pool，还是多个 scheduler 共用 pool；
-- router 按请求数、token 数还是显式 key 选择副本；
-- prefix cache 是否只在副本内部复用；
-- `max_num_seqs`、`max_running_requests` 是全服务限制还是每分区限制。
-
-这些问题必须阅读 controller、engine、scheduler 和 cache manager，不能从 `--dp-size` 字面推断。
-
-## 8. MoE 与 Expert Parallel
-
-Mixture of Experts（MoE）层包含 router 和多个 experts。每个 token 通常只进入其中少数 experts，但模型仍需在集群中放置全部 expert 权重。
-
-### 8.1 先拆开 MoE 的组件
-
-一个 MoE block 可能包含：
-
-- attention；
-- router/gate；
-- routed experts；
-- shared experts；
-- shared expert gate；
-- dense fallback 或其他辅助模块。
-
-Expert Parallel（EP）主要描述 routed experts 如何分布，不等于整个 block 都除以 EP。
-
-### 8.2 EP 的两类工作
-
-1. **放置 expert 权重**：不同 EP rank 持有不同 expert 子集，或者继续切分单个 expert 矩阵。
-2. **路由 token**：根据 router 结果，将 token 通过 all-to-all 等方式发送到持有目标 expert 的 rank，再把结果送回。
-
-假设有 8 个 experts、`EP=4`，最简单的教学布局是每个 EP rank 持有 2 个 experts。但真实实现还可能包括：
-
-- expert 数不能整除时的 padding；
-- 冗余 experts；
-- 一个 expert 内继续做 tensor parallel；
-- shared experts 在所有 rank 复制或采用另一套 TP；
-- expert load balancing 和运行时迁移；
-- quantized expert 的 scale/metadata 放置。
-
-### 8.3 EP 不一定增加物理 GPU 数
-
-很多实现是在已有的一组物理 ranks 上建立 EP group，重新解释这些 rank 的 expert 权重归属。因此不能看到 `EP=8` 就再把 worker 数乘以 8。
-
-正确问题是：
+这类策略应逐组件描述：
 
 ```text
-EP group 由哪些 global ranks 组成？
-这些 ranks 是否已经是 TP/DP ranks？
-每个 rank 最终持有哪些 experts 和 expert tensor slices？
+attention:
+  在哪个 group 内分片或复制？
+
+MoE experts:
+  在哪些 ranks 上放置？
+
+scheduler / KV:
+  请求在哪个分区内竞争容量？
 ```
 
-### 8.4 MoE 的运行时峰值
+SGLang 的 DP Attention、vLLM 的部分 MoE 数据并行语义，都不能套用“DP 等于完整副本”这一句话。名称相同，权重和 KV 的归属可能不同。
 
-MoE 显存不只有 expert 权重。运行时还可能包括：
+### 3.5 Expert Parallel：分布 routed experts
 
-- router logits 和 top-k index；
-- token permutation 和 unpermutation buffer；
-- all-to-all send/receive buffer；
-- capacity padding；
-- fused MoE kernel workspace；
-- expert 负载统计；
-- 重分配或迁移期间的临时双份权重。
+MoE block 不只有 experts。它还可能包含 attention、router、shared experts、shared expert gate 和量化辅助 tensor。
 
-这些项与 token 分布、backend 和 kernel 实现相关，通常需要版本化预算或实测边界。
+EP 主要处理 routed expert 的放置与 token dispatch。例如 8 个 experts 分到 4 个 EP ranks，最简单的布局是每 rank 两个 experts。实现中还可能有：
 
-## 9. Context Parallel 与 Decode Context Parallel
+- expert padding 或冗余副本；
+- 单个 expert 内继续做 TP；
+- shared experts 复制，或使用另一套 TP group；
+- all-to-all 的 send/receive 与 permutation buffer。
 
-Context Parallel（CP）试图沿 token 或 sequence/context 维度分工，而不是沿模型 hidden 维或 layer 维分工。
+EP group 常建立在已有 TP/DP ranks 上。看到 `EP=4` 不能直接把设备数再乘 4，应从 group construction 找出它复用了哪些 global ranks。
 
-### 9.1 CP 的基本动机
+### 3.6 CP 与 DCP：切 token 或 context 工作
 
-长上下文 Prefill 的 activation 和 attention 计算很大。如果将一段 sequence 分给多个 rank，各 rank 可以只处理部分 query/token slice，再通过通信获得 attention 所需的信息。
+Context Parallel 沿 sequence、token 或 context 维协作。它不是跨框架统一的实现名称。
 
-但“CP”不是跨框架统一的一种实现。需要逐项确认：
+阅读 CP 时需要确认：
 
 - 它作用于 Prefill、Decode，还是两者；
-- 它切 query、K/V、token block 还是 attention state；
-- 是否增加新的 worker；
-- 是否复用已有 TP ranks；
-- 需要 all-gather、all-to-all、ring attention 还是 LSE 合并；
-- KV cache 是分 token、分 head，还是复制；
-- 哪些 attention backend 支持。
+- 分的是 query、KV token、block，还是 attention 中间状态；
+- 它创建新 workers，还是在已有 TP ranks 上建 subgroup；
+- KV 是分 token、分 head，还是发生复制；
+- 哪个 attention backend 真正接入了这条路径。
 
-### 9.2 DCP 的常见语义
+DCP 通常专注 Decode context，常见实现会复用 TP workers。此时 worker 数和 checkpoint 权重可能不变，变化的是 Decode 的 token ownership、attention 工作和通信。
 
-Decode Context Parallel（DCP）通常专注 Decode 阶段，把历史 KV/context 工作分给多个 rank。常见实现会复用现有 TP ranks，而不是创建额外 GPU。
+`DCP=2` 不能作为除数直接作用于总权重或总显存。
 
-例如 TP group 有 4 个 ranks，`DCP=2` 可能在 TP group 内形成两个或若干 DCP subgroup。此时：
+## 4. 显存账本：先算 raw peak，再判断安全余量
 
-- worker 数仍由原 TP/PP 等拓扑决定；
-- checkpoint 权重未必改变；
-- Decode 的 KV token slice、attention work 和通信发生变化；
-- 每卡 KV 是否真正下降，取决于 cache layout 和 backend；
-- Graph 和 workspace 也可能变化。
+显存账本要区分 allocation 的生命周期。一个实用的分类是：
 
-因此，不能把 DCP 当成额外除数直接应用于总权重或总显存。
+| 类别 | 例子 | 常见生命周期 |
+| --- | --- | --- |
+| 模型常驻项 | 权重、量化 metadata | 模型加载后长期存在 |
+| cache 常驻项 | 预分配 KV pool、状态缓存 | 服务期长期存在 |
+| Graph 常驻项 | private pool、静态输入输出 buffer | capture 后在适用 runner 中保留 |
+| runtime 常驻项 | CUDA context、通信 buffer、allocator reserve | 进程或服务期存在 |
+| 阶段临时项 | eager activation、capture scratch、MoE workspace | 某次 phase 内存在 |
+| 自定义项 | connector staging、模型特有 state | 由实际生命周期决定 |
 
-### 9.3 不要把所有 CP 压成一个数字
+### 4.1 Raw peak 是实际共存 allocation 的峰值
 
-下面这些配置即使名字都含 `context parallel`，也可能完全不同：
-
-| 语义 | 可能作用阶段 | 是否增加 worker | 主要影响 |
-| --- | --- | --- | --- |
-| Prefill context split | Prefill | 依实现而定 | 长 prompt activation、attention 通信 |
-| Decode context split | Decode | 常复用现有 rank | 历史 KV 处理、decode attention |
-| Attention 内部 CP | Prefill 或 Decode | 常复用某个 world | 有效 attention TP、KV/head/token ownership |
-
-阅读配置字段只是起点，必须追到 group construction、attention forward 和 cache layout。
-
-## 10. Scheduler、cache partition 与容量域
-
-显存规划不能只知道“全服务共有多少 KV cache”，还要知道 cache 分成了哪些独立容量域。
-
-> **容量域**：一组请求可以共同竞争和复用的缓存资源边界。它可能对应一个 engine、一个 scheduler、一个 DP 副本，或一个 attention 请求分区。
-
-### 10.1 为什么容量域重要
-
-假设服务有两个彼此独立的 KV pools，各有 `40 GiB`：
-
-- 服务聚合 KV 是 `80 GiB`；
-- 但一个被路由到 pool 0 的请求最多只能使用 pool 0 可提供的空间；
-- pool 0 OOM 时，pool 1 的空闲空间不会自动变成 pool 0 的空间；
-- prefix cache 命中通常也只在拥有相应 block 的域内成立。
-
-所以至少要分别理解：
-
-- 全服务 aggregate capacity；
-- 每个 scheduler/cache partition capacity；
-- 单请求在一个容量域内可达到的最大 context。
-
-### 10.2 请求路由必须和 cache ownership 一起读
-
-源码阅读可以按以下链路追踪：
+对物理设备 `d` 和阶段 `p`：
 
 ```text
-HTTP / RPC request
-  -> router/controller 选择 endpoint
-  -> endpoint 对应 scheduler
-  -> scheduler 选择 worker group
-  -> cache manager 分配 blocks/pages
-  -> attention layer 读取本地 cache slice
+raw_peak(d, p)
+  = resident_bytes_alive_in_phase(d, p)
+  + peak_transient_bytes(d, p)
 ```
 
-只看最后的 KV tensor shape，可能会遗漏前面已经把请求拆到不同容量域这一事实。
+如果一个设备上绑定多个进程，`resident_bytes` 和 `transient_bytes` 都要按进程聚合。同一块共享或复用内存只能记一次。
 
-## 11. KV page/block：逻辑 token 不等于实际分配字节
-
-推理框架通常不为每个请求连续分配一整块最大长度 KV，而是把 cache 预先组织为固定大小的 page 或 block。
-
-### 11.1 逻辑 payload 与物理分配
-
-假设：
+设备最终峰值是：
 
 ```text
-block size = 16 tokens
-本地 KV payload = 128 KiB/token
-一个请求实际需要 17 tokens
+raw_peak(d) = max(raw_peak(d, p) for each supported phase p)
 ```
 
-那么它至少占用 2 blocks，也就是 32-token capacity。逻辑 payload 只有 `17 x 128 KiB = 2.125 MiB`，但它会在框架预分配的 KV pool 中消耗 `32 x 128 KiB = 4 MiB` 容量。最后 15 个 token 槽暂时未使用，但对应 block capacity 已被这个请求占用。
+这里的 phase 不是把曾经见过的所有最大值相加。Capture 临时 workspace 不会自动和稳态 Prefill activation 共存；若 scheduler 有 Prefill/Decode 混合路径，则应另建 mixed phase。
 
-这里要区分两层账：KV pool 的 resident bytes 通常在服务启动时一次性计入设备显存；请求长度只决定从该 pool 中占用多少 blocks。显存规划器不能再把每个请求的 `4 MiB` 作为额外物理分配与整个 pool 重复相加，而应使用它判断目标 workload 需要的 block 数是否超过 pool capacity。
+### 4.2 安全余量不是 allocation
 
-常见关系是：
+安全余量用于判定，不应加进 raw peak。假设设备可用显存为 `available`，配置的余量比例为 `r`：
 
 ```text
-requested blocks  = ceil(required tokens / block_size)
-occupied capacity = requested blocks x bytes_per_block
+operational_ceiling = available x (1 - r)
 ```
 
-实际实现还可能包含：
-
-- block metadata；
-- request-to-token 映射表；
-- hash、reference count 和 free list；
-- prefix cache 的共享引用；
-- alignment 和 allocator rounding；
-- hybrid attention 中多种 cache group。
-
-### 11.2 为什么“差一个 block”是合理误差边界
-
-理论公式能准确得到 payload，但请求长度映射到 page 后会发生离散化。比较估算和实测时，应先确认差值是否来自：
-
-- page/block 向上取整；
-- 每层或每 cache group 分别取整；
-- worker 间统一采用最小 block 数；
-- cache pool 预分配时的 alignment。
-
-如果不统一 page 语义，仅比较小数 GiB 很容易得出错误结论。
-
-## 12. Prefill、Decode 与 Chunked Prefill
-
-### 12.1 Prefill
-
-Prefill 一次处理 prompt 中的多个 token，为每层生成初始 KV。其特点通常是：
-
-- 单次 forward token 数大；
-- activation 峰值高；
-- attention kernel 处理长 sequence；
-- 新增大量 KV；
-- 可能需要和已有 running Decode 请求共存。
-
-### 12.2 Decode
-
-Decode 通常每个请求每步生成一个或少量 token，但会同时处理多个 running requests：
-
-- 单步新 token 少；
-- 要读取较长历史 KV；
-- batch size 可能较大；
-- 常使用 CUDA Graph 降低 launch overhead；
-- KV pool 会随生成持续增长。
-
-### 12.3 Chunked Prefill
-
-Chunked Prefill 把一个长 prompt 拆成多个 chunk，而不是一次全部 forward。例如 `32k` prompt 可以按 `8k` token 的 chunk 分四次处理。
-
-它主要改变：
-
-- 单次 Prefill 的最大活跃 token 数；
-- activation 和部分 workspace 峰值；
-- Prefill 与 Decode 混合调度时的同时存在关系；
-- 某些 Graph capture shape。
-
-它通常不会减少该请求最终需要保存的总 KV：四个 chunk 完成后，仍要保留完整 `32k` prompt 对应的 KV。
-
-### 12.4 `max model length`、batch token 和 chunk size 不是同一输入
-
-| 参数概念 | 回答的问题 |
-| --- | --- |
-| max context / model length | 单请求 input + output 最多允许多少 token |
-| max batched tokens | 一次 scheduler iteration 最多处理多少新 token |
-| chunked prefill size | 一个 Prefill chunk 最多处理多少 token |
-| max running requests/sequences | 同时处于运行状态的请求数 |
-| KV pool tokens | cache 容量域中可以保存多少历史 token |
-
-它们共同影响显存，但不能互相替代。
-
-## 13. CUDA Graph、activation 与 workspace
-
-### 13.1 CUDA Graph 为什么占显存
-
-CUDA Graph 会记录一组固定 shape 的 GPU 操作，以便后续快速 replay。为了保证 replay 时地址稳定，框架可能为捕获 shape 保留：
-
-- 静态输入/输出 buffer；
-- activation memory pool；
-- kernel workspace；
-- 每种 batch size 或 token shape 的 graph executable 相关资源。
-
-Graph 显存通常与下列组合有关：
+然后分别比较：
 
 ```text
-框架版本
-+ 模型实现
-+ attention / MoE backend
-+ capture shapes
-+ 最大 capture batch/token 数
-+ 并行 topology
-+ dtype / quantization
+raw_peak > available
+  -> 物理 OOM
+
+operational_ceiling < raw_peak <= available
+  -> 未 OOM，但没有满足安全余量
+
+raw_peak <= operational_ceiling
+  -> 满足该安全余量条件
 ```
 
-因此它不是一个跨框架固定比例，也不应仅按参数量估算。
+这只是容量判断。若 activation、Graph 或 runtime 尚无适用预算，结论仍需保留不确定性，不能因为算式小于上限就声称一定能运行。
 
-### 13.2 Capture、Prefill、Decode 是不同显存阶段
+### 4.3 Graph 要拆成常驻和捕获临时项
 
-服务启动可能经历：
-
-1. 初始化和加载权重；
-2. profile/dummy run；
-3. CUDA Graph capture；
-4. 稳态 Prefill；
-5. 稳态 Decode；
-6. 混合批次或特殊 runtime 路径。
-
-不同阶段的显存项并非全部同时存在。正确峰值算法是分别计算同阶段共存项，再取最大值：
+CUDA Graph 不是一个单一比例。至少要区分：
 
 ```text
-peak(worker)
-  = max(
-      init_or_capture_peak,
-      prefill_peak,
-      decode_peak,
-      other_supported_phase_peak
+graph resident
+  capture 后继续存在的 private pool、static buffers 等
+
+capture transient
+  只在捕获过程中出现的 activation、scratch 或临时副本
+
+replay transient outside graph pool
+  replay 时仍在 graph pool 之外分配的工作区
+```
+
+Graph capture 阶段的峰值可能写成：
+
+```text
+capture raw peak
+  = weights
+  + KV pool already allocated at capture time
+  + runtime resident
+  + graph resident allocated so far
+  + capture transient
+```
+
+稳态 Decode 若走 replay，需要把 replay activation 分成两部分。Graph pool 已覆盖的
+allocation 只计在 Graph resident 中，不能再加一份同 shape 的 activation 估算；
+pool 之外的 workspace 才进入 Decode transient。Prefill 走 eager、Decode 走
+Graph 时，二者也应分开建账。
+
+框架报告的 `graph memory` 可能是捕获前后 free memory 的差，也可能是估算值。使用前要查清 runner 路径和测量口径。
+
+### 4.4 Activation、workspace 与 allocator
+
+Activation 受当前 forward token 数、hidden size、模型结构、backend 与并行布局影响。Chunked prefill 改变的是每次 forward 的 token 数，不是最终 KV 长度。
+
+Workspace 包括 attention scratch、GEMM workspace、MoE permutation、collective buffer、PP 边界 buffer 和 connector staging。它们常由具体实现决定，仅靠 checkpoint 无法精确推导。
+
+Allocator reserve、fragmentation 和 CUDA context 也属于实际设备占用，但不要和安全余量混为一谈：前者是 allocation 或保留量，后者是人为留下的容量门槛。
+
+## 5. KV cache：pool 显存与请求占用是两本账
+
+多数 serving 框架会在启动时创建固定大小的 KV pool。此后 Prefill 和 Decode 从 pool 中申请 blocks，pool 的 resident bytes 通常不会随每个 token 再增长一遍。
+
+### 5.1 先算本地每个 stored token 的 payload
+
+标准 attention 的教学公式是：
+
+```text
+bytes_per_stored_token_local
+  = sum over local attention layers (
+      local_K_elements_per_token
+      + local_V_elements_per_token
     )
+    x cache_dtype_bytes
 ```
 
-把所有阶段见过的最大临时项无条件相加会过度保守；只看稳态 Decode 又可能漏掉启动时 Graph capture OOM。
+这里的 `local` 已经包含 PP 层归属、KV head 分片或复制，以及模型特有 cache layout。不要在公式末尾再次无条件除以 TP、PP、CP 或 DCP。
 
-### 13.3 Workspace 是实现相关项
+接着确定本 rank 实际拥有多少 token slots：
 
-典型 workspace 包括：
+```text
+owned_slots
+  = num_local_blocks x block_size
 
-- attention kernel scratch；
-- GEMM tuning/workspace；
-- MoE permutation 和 all-to-all buffer；
-- collective library buffer；
-- CP/DCP 中间结果或 LSE；
-- PP send/receive buffer；
-- allocator fragmentation 和 memory pool reserve。
-
-这部分正是需要源码、版本化经验预算和实测校准的原因。校准不是为了把理论值“修饰得更准”，而是给无法仅靠模型结构确定的实现项建立可用边界。
-
-## 14. PD 分离中的显存归属
-
-Prefill-Decode disaggregation（PD 分离）把 Prefill 和 Decode 放到两个部署组：
-
-```mermaid
-flowchart LR
-    accTitle: PD 分离请求与缓存流
-    accDescr: Prefill 部署组生成请求的 KV 状态，经 connector 发送后由 Decode 部署组接收并继续生成
-
-    request["请求"] --> prefill["Prefill 部署组"]
-    prefill --> kv["生成 KV / 状态"]
-    kv --> connector["Connector / transfer"]
-    connector --> decode["Decode 部署组"]
-    decode --> output["生成输出"]
+kv_pool_resident_bytes
+  = bytes_per_stored_token_local
+  x owned_slots
+  + cache_alignment_or_metadata_if_applicable
 ```
 
-### 14.1 P/D 是两套独立显存账本
+CP/DCP 可能改变 `bytes_per_stored_token_local`，也可能改变 `owned_slots`，取决于它分 head 还是分 token。必须从 cache layout 选择其中正确的 ownership 维度，不能重复除法。
 
-两个部署组通常各自具有：
+### 5.2 Block rounding 决定请求占用容量
 
-- 硬件和 worker topology；
-- 权重副本；
-- scheduler 和请求生命周期；
-- cache pool；
-- Graph、activation 和 runtime reserve。
+假设 block size 是 16 tokens，一个没有 prefix 共享的请求当前需要保存 17 tokens：
 
-Prefill 侧与 Decode 侧可以使用不同并行拓扑，因此应分别找最坏卡和容量，不能把 P/D 显存相加成“一张卡的需求”，也不能把二者 KV 容量相加成单请求 context。
+```text
+occupied_blocks = ceil(17 / 16) = 2
+occupied_slots  = 2 x 16 = 32
+```
 
-### 14.2 传输字节不等于额外常驻显存
+请求在 pool 中占用 32 个 token slots，其中 15 个暂时没有承载有效 token。这个 rounding 用于判断 workload 是否超过 pool capacity，不是要在 KV pool resident bytes 之外再加一份请求 KV 显存。
 
-已有 KV 从 Prefill 传到 Decode，不代表 Prefill 一定额外复制一整份 KV。需要检查 connector：
+多个请求的简化容量检查为：
 
-- 是否直接注册现有 cache buffer；
-- 是否分配 send/receive staging buffer；
-- 是否因两侧 TP/head layout 不同而 gather/scatter；
-- metadata、队列和 inflight requests 占多少空间；
-- Decode 是否在传输完成前预分配目标 KV blocks。
+```text
+required_blocks
+  = sum(ceil(stored_tokens_for_request_i / block_size))
 
-只有实际存在的 staging 和转换 buffer 才应作为额外显存项，不能把“网络传输量”直接当成“GPU 常驻量”。
+required_blocks <= allocatable_blocks_in_this_capacity_domain
+```
 
-## 15. 如何从源码确认一种并行策略
+真实实现还可能有 prefix block 共享、speculative slots、cache group 分别取整、
+滑窗回收或 block metadata。Metadata 也要先确认存放位置：host 侧索引不计入
+设备显存，device tensor 则进入对应 device ledger。这些规则应由 cache adapter
+提供。
 
-参数名只能说明用户可以表达什么，不能证明运行时最终做了什么。建议按下面的顺序逐层阅读：
+### 5.3 Prefill 和 Decode 增长的是占用，不是第二个 pool
+
+Prefill 把 prompt KV 写入已分配的 blocks；Decode 随生成继续占用更多 blocks。若 pool 已预分配，设备 resident bytes 基本固定，变化的是：
+
+- free blocks 数量；
+- 每个请求占用的 block 映射；
+- 是否因容量不足而无法调度或触发抢占；
+- 少量随请求增长的 metadata。
+
+只有框架采用按需物理分配，或者会扩缩 pool 时，token 增长才会改变 resident allocation。这个事实要由目标版本源码确认。
+
+### 5.4 容量域决定空闲 KV 能不能互相借用
+
+容量域是一组请求可以共同竞争 blocks 的边界。它可能对应一个 scheduler、一个 DP replica 或某个 attention 分区。
+
+两个独立 pools 各有 40 GiB：
+
+- 服务聚合 KV 是 80 GiB；
+- 路由到 pool 0 的请求只能使用 pool 0 的 blocks；
+- pool 1 的空闲空间不会自动借给 pool 0；
+- prefix cache 的共享通常也受这个边界限制。
+
+因此至少要分别输出服务聚合容量、每个容量域的容量，以及单请求在目标域内可达到的最大 context。
+
+`max model length`、`max batched tokens`、chunk size 和并发数也不是同一个输入：
+
+| 概念 | 限制什么 |
+| --- | --- |
+| max model length | 单请求 input + output 的长度上限 |
+| max batched tokens | 一次 scheduler iteration 处理的新 token 上限 |
+| chunk size | 一次 prefill forward 的 token 上限 |
+| max running requests | 同时参与运行的请求数量 |
+| KV pool slots | 一个容量域能保存的历史 token 槽位 |
+
+## 6. 算一遍：TP=2、PP=2、DP=2
+
+下面用一个虚构模型说明推导过程。数字只用于教学，不代表 vLLM 或 SGLang 的真实占用。
+
+### 6.1 先画 worker 拓扑
+
+每个普通 DP replica 内有 `TP x PP = 4` 个 workers，`DP=2` 共 8 个。下表使用
+部署级 worker 编号，便于把两份副本放在一起看：
+
+| worker 编号 | DP | PP | TP | 物理设备 |
+| ---: | ---: | ---: | ---: | --- |
+| 0 | 0 | 0 | 0 | GPU 0 |
+| 1 | 0 | 0 | 1 | GPU 1 |
+| 2 | 0 | 1 | 0 | GPU 2 |
+| 3 | 0 | 1 | 1 | GPU 3 |
+| 4 | 1 | 0 | 0 | GPU 4 |
+| 5 | 1 | 0 | 1 | GPU 5 |
+| 6 | 1 | 1 | 0 | GPU 6 |
+| 7 | 1 | 1 | 1 | GPU 7 |
+
+以 worker 5 为例：`PP=0` 决定它持有 embedding 和前半层，`TP=1` 决定这些 tensor
+的本地 slice，`DP=1` 表示它属于第二个请求与 cache 域。三个坐标最后只生成
+GPU 5 的一份账本。
+
+真实的 global rank 要由 launcher 决定。两个普通 DP replicas 可能各自拥有
+`global rank 0..3`，也可能处于同一个八进程 world；不能从 `TP x PP x DP` 这三个
+配置值直接认定 rank 编号。无论采用哪种启动方式，设备账本的推导方法不变。
+
+### 6.2 再按 stage 计算常驻项
+
+假设 checkpoint placement 与实测预算得到：
+
+| 常驻项 | PP stage 0 每卡 | PP stage 1 每卡 |
+| --- | ---: | ---: |
+| 本地权重 | 18.5 GiB | 17.0 GiB |
+| KV pool resident | 20.0 GiB | 22.0 GiB |
+| runtime resident | 1.5 GiB | 1.5 GiB |
+| Graph resident | 3.0 GiB | 2.5 GiB |
+| 稳态 resident 小计 | 43.0 GiB | 43.0 GiB |
+
+stage 0 因 embedding 更大；stage 1 的本地 attention layers 或 cache layout 让
+KV pool 更大。按 PP 平均分配总字节会漏掉这种不对称。
+
+普通 DP 复制这套布局，所以部署级 worker 0 和 4 的组件相同，worker 1 和 5 相同。
+DP 没有让单卡数字再除以 2。
+
+### 6.3 按 phase 加入实际共存的临时项
+
+假设版本化校准给出：
+
+| Phase | Stage 0 transient | Stage 0 raw peak | Stage 1 transient | Stage 1 raw peak |
+| --- | ---: | ---: | ---: | ---: |
+| Graph capture | 8.0 GiB | 51.0 GiB | 6.0 GiB | 49.0 GiB |
+| Prefill eager | 7.0 GiB | 50.0 GiB | 5.0 GiB | 48.0 GiB |
+| Decode replay | 1.0 GiB | 44.0 GiB | 1.5 GiB | 44.5 GiB |
+
+表中的 Decode transient 只包括 Graph pool 之外的 allocation，replay working memory 已计入 Graph resident，因而没有重复相加。
+
+最坏设备位于 stage 0，最坏阶段是 Graph capture，raw peak 为 51 GiB。两个 DP replicas 都会出现同样的最坏卡。
+
+若每卡实际可用显存为 56 GiB，安全余量为 5%：
+
+```text
+operational_ceiling = 56 x 0.95 = 53.2 GiB
+
+raw_peak = 51 GiB
+```
+
+这个示例满足安全余量条件。若 Graph transient 没有目标版本和设备的依据，最终
+状态仍应标明该项待校准。
+
+### 6.4 上下文容量另算
+
+假设每个 DP replica 有一个独立 KV 容量域。两个 replica 的 aggregate capacity 可以相加，用于描述整个服务能承载多少请求；单请求最大 context 不能跨 replica 相加。
+
+对目标 workload，应在每个容量域内做 block rounding：
+
+```text
+sum(ceil(request_stored_tokens / block_size))
+  <= blocks available in that replica
+```
+
+这一步回答“权重加载后支持多大上下文”，与前面的 device raw peak 相关但不是同一道算式。
+
+## 7. PD 分离与源码阅读路线
+
+在本项目中，PD 分离把同一个 fixed checkpoint 的 Prefill 和 Decode 放入两个部署
+组。两组使用同一框架及固定版本，可以采用不同的硬件、机器数量和并行拓扑；每个
+部署组内部的机器和设备规格保持一致。P/D 各自建立设备账本与 cache 容量域。
 
 ```mermaid
 flowchart TB
-    accTitle: 并行策略源码审计路径
-    accDescr: 从用户参数开始，依次追踪默认值解析、worker 拓扑、通信组、模型放置、缓存、调度和运行阶段，并用测试证据闭环
+    accTitle: PD 分离的请求和状态流转
+    accDescr: Prefill 部署组建立请求状态，通过 connector 传到 Decode 部署组继续生成
 
-    cli["1. CLI / 配置字段"] --> resolve["2. 默认值与参数改写"]
-    resolve --> launch["3. Launcher 与 worker 数"]
-    launch --> groups["4. Rank 坐标与 process groups"]
-    groups --> model["5. 模型构造与权重 loader"]
-    model --> cache["6. Attention 与 cache layout"]
-    cache --> scheduler["7. Scheduler 与请求归属"]
-    scheduler --> runtime["8. Graph / activation / workspace"]
-    runtime --> evidence["9. Tests / recipes / 实测证据"]
+    input_request["输入请求"] --> prefill_group["Prefill 部署组"]
+    prefill_group --> kv_state["KV / model state"]
+    kv_state --> pd_connector["connector"]
+    pd_connector --> decode_group["Decode 部署组"]
+    decode_group --> output_tokens["输出 token"]
 ```
 
-### 15.1 第 1 层：CLI 与配置字段
+### 7.1 P/D 要分别展示
 
-记录：
+Prefill 侧和 Decode 侧各有自己的：
 
-- 用户能设置哪些参数；
-- 参数默认值和别名；
-- help text 声称的作用；
-- 配置对象之间如何传递。
+- 权重副本与 workers；
+- scheduler、KV pool 和容量域；
+- Graph、activation、runtime reserve；
+- 最坏设备与最坏阶段。
 
-此时只能得到“表面配置”，不能直接形成显存结论。
+不能把 P/D 的显存相加成一张卡的需求，也不能把两侧 KV pool 相加成单请求最大 context。
 
-### 15.2 第 2 层：Resolved configuration
+Connector 的网络传输字节不等于额外常驻显存。需要检查 send/receive staging、
+layout 转换和 gather/scatter，也要确认传输窗口内的状态归属。Prefill sender 可能
+在确认完成前继续保留源 blocks，Decode receiver 可能提前预留目标 blocks。两侧
+各自按本地生命周期计峰值；sender retention 与 receiver reservation 同时存在，
+表示跨部署组的资源重叠，不是把两组显存合成一张卡。
 
-搜索参数验证和自动改写：
+### 7.2 源码应按数据流阅读
 
-- 是否根据模型类型自动开启或关闭功能；
-- 是否根据 TP/DP 等计算有效并行宽度；
-- 是否改写 chunk size、Graph shapes、backend；
-- 哪些组合会被拒绝；
-- 环境变量是否覆盖 CLI。
+仅搜索 `tensor_parallel_size` 或 `dp_size`，只能发现入口。可靠的阅读顺序是：
 
-显存计算应使用 resolved 事实，而不是只保存原始命令值；原始值仍应保留用于解释和往返导出。
+```mermaid
+flowchart TB
+    accTitle: 并行策略源码阅读路线
+    accDescr: 从参数进入，沿配置解析、进程拓扑、通信组、模型放置和请求缓存追到真实显存生命周期
 
-### 15.3 第 3 层：Launcher 和 worker 数
-
-确认：
-
-- 总共启动多少模型 workers；
-- 每台机器启动多少；
-- controller/router 是否使用 GPU；
-- DP 是多个独立 worlds 还是一个大 world；
-- local rank 如何映射到设备；
-- 多机 rank 如何排列。
-
-这是判断“并行度是否增加物理卡”的唯一可靠入口之一。
-
-### 15.4 第 4 层：Rank 坐标和 process groups
-
-找到 distributed initialization 和 group construction，画出：
-
-- global rank tensor 的 shape 和轴顺序；
-- TP、PP、DP、EP、CP/DCP group 的成员；
-- 哪些 group 复用同一批 ranks；
-- 一个 worker 具有哪些派生坐标。
-
-建议用一个小配置手工枚举 rank 表，避免被多维 reshape 误导。
-
-### 15.5 第 5 层：模型构造和权重 loader
-
-按组件检查：
-
-1. embedding 和 `lm_head`；
-2. Q/K/V/O；
-3. dense FFN；
-4. routed/shared experts；
-5. norm、bias 和量化辅助 tensor；
-6. MTP、draft 或模型特有模块。
-
-不要只读通用 `ParallelLinear`。模型文件可能传入不同 group、覆盖 loader，或在特定量化路径上采用另一种 layout。
-
-### 15.6 第 6 层：Attention 和 cache layout
-
-确认：
-
-- cache dtype；
-- 本地 KV heads、layers 和 token slice；
-- page/block size；
-- cache groups 和 hybrid cache；
-- PP stage 如何统一 block 数；
-- CP/DCP 如何改变 ownership；
-- prefix cache 的共享范围。
-
-KV payload 公式应该从这些 resolved local dimensions 构造。
-
-### 15.7 第 7 层：Scheduler 和请求归属
-
-追踪一个请求：入口如何路由、由哪个 scheduler 接收、在哪个 cache partition 分配 block、由哪些 workers 执行。
-
-这一层决定：
-
-- 普通 DP 的副本边界；
-- 服务 aggregate capacity 与单分区 capacity；
-- 单请求 max context；
-- P/D 传输前后的生命周期和额外预分配。
-
-### 15.8 第 8 层：Graph、activation 与 runtime
-
-搜索 profile、dummy run、capture、memory pool 和 reserve：
-
-- capture 哪些 shapes；
-- Prefill 与 Decode 是否分别捕获；
-- activation 如何估计或实测；
-- 哪些 backend 分配常驻 workspace；
-- 初始化峰值是否高于服务稳态峰值。
-
-这部分通常需要和目标设备实测对齐，不能仅靠静态模型元数据。
-
-### 15.9 第 9 层：测试与能力证据
-
-一个参数出现在 CLI、一段实现可以 import，均不等于目标组合可用。至少区分：
-
-- 源码具有实现路径；
-- 参数验证允许；
-- 模型接入该路径；
-- 目标 backend/量化/并行组合有测试；
-- 目标硬件实际运行通过。
-
-能力结论应绑定框架版本、模型、checkpoint、backend、量化和 topology，不能只写“支持 TP/EP/CP”。
-
-## 16. 常见误解与纠正
-
-| 常见误解 | 为什么错误 | 正确检查方式 |
-| --- | --- | --- |
-| 每卡权重等于 checkpoint / TP / PP | tensor 分片规则不同，PP stage 非对称 | 按 tensor placement 和 stage layers 求和 |
-| TP、PP、DP、EP rank 显存要相加 | 它们可能是同一物理 worker 的坐标 | 先解析物理 worker，再结算其所有组件 |
-| DP 增大后单请求 context 会增大 | 普通 DP 通常是独立 cache 容量域 | 检查请求是否能跨副本共享 KV |
-| EP=8 就需要在 TP 之外再乘 8 张卡 | EP 常复用已有 ranks | 阅读 EP group 的实际成员 |
-| DCP=2 就把总显存除以 2 | DCP 常只改变 Decode KV/context 分工 | 检查权重、KV layout 和 backend 分别如何变化 |
-| chunked prefill 会降低最终 KV | 它主要降低一次 forward 的活跃 token 峰值 | 分开计算 activation 峰值和最终 cache payload |
-| Graph 是固定百分比 | capture shapes 和 backend 会改变保留量 | 阅读 capture 列表并使用版本化实测预算 |
-| 网络传了多少 KV 就额外占多少 GPU 显存 | connector 可能直接使用已有 cache buffer | 检查 staging、gather/scatter 和预分配 |
-| CLI 有参数就表示模型支持 | 模型/backend 可能未接入或显式拒绝 | 检查模型实现、validation、tests 和实测 |
-
-## 17. 阅读两份框架审计文档的建议路线
-
-读完本文后，再按以下顺序阅读版本化源码审计，可以减少被相同参数名误导的风险。
-
-### 17.1 第一遍：只建立执行拓扑
-
-分别在 vLLM 和 SGLang 审计文档中寻找：
-
-1. public parameters 和 resolved defaults；
-2. worker/world 数量公式；
-3. global rank 的坐标布局；
-4. 实际建立的 process groups；
-5. scheduler 和 cache partition 数量。
-
-第一遍先回答“有多少张物理卡、多少个执行和容量域”，不要急着计算显存。
-
-### 17.2 第二遍：逐组件画 placement 表
-
-对每个物理 worker 关注：
-
-- PP stage 持有哪些 layers；
-- attention 使用哪个有效 TP/group；
-- K/V 是否因 GQA/MQA 复制；
-- dense FFN 如何分片；
-- routed/shared experts 各自如何放置；
-- embedding、head、norm、scale 是否复制。
-
-此时才形成每卡权重事实。
-
-### 17.3 第三遍：追请求和 KV
-
-从 router/controller 追踪请求到 scheduler 和 cache：
-
-- 普通 DP 与组件级 DP 的区别；
-- 每个 cache partition 的 workers；
-- PP、CP、DCP 如何改变本地 KV；
-- page/block 和 prefix cache 的作用域；
-- PD 模式 P/D 两侧分别如何分配和传输。
-
-### 17.4 第四遍：补齐经验显存项
-
-最后阅读：
-
-- chunked prefill 和 batch token；
-- CUDA Graph capture shapes；
-- activation profile；
-- collective/MoE/connector workspace；
-- allocator 和 runtime reserve；
-- 目标版本的测试和不支持组合。
-
-最终应能把任意关键结论写成下面的证据链：
-
-```text
-用户参数
-  -> resolved 配置
-  -> worker 和 group
-  -> 模型组件 / 请求 / cache 归属
-  -> 物理 GPU 上的显存项
-  -> 目标运行阶段的峰值
-  -> 对应源码和测试证据
+    cli_config["CLI / config"] --> resolved_config["默认值、验证与改写"]
+    resolved_config --> worker_launch["launcher / worker placement"]
+    worker_launch --> group_build["rank layout / process groups"]
+    group_build --> model_build["model layers / weight loader"]
+    model_build --> cache_layout["attention / KV layout"]
+    cache_layout --> scheduler_path["scheduler / request ownership"]
+    scheduler_path --> runtime_path["profile / Graph / workspace"]
+    runtime_path --> test_evidence["tests / recipes / 实机证据"]
 ```
 
-### 17.5 比较两个框架时的原则
+参数解析先记录原始值，再找 resolved configuration。框架可能自动改 backend、
+限制 Graph shape，或者根据模型类型关闭某种并行策略。显存计算使用解析后的事实，
+同时保留原始参数供解释和命令往返。
 
-应先分别完成上述四遍阅读，再阅读异同文档。比较时使用运行事实，而不是仅比较名字：
+Launcher 决定总 worker 数、每机进程数、local rank 到 device 的映射，以及
+controller 是否占卡。由此可以判断 `DP`、`EP`、`CP` 是否增加物理 workers。
 
-- 两边的 `DP` 是否都表示独立完整副本；
-- 两边的 `EP` 是否使用相同 ranks、相同 expert placement；
-- 两边的 `CP/DCP` 是否作用于同一阶段和 cache 维度；
-- 同一个模型在两边是否使用相同 QKV、MoE 和量化 layout；
-- scheduler/cache partition 是否具有相同边界。
+Process group construction 给出各并行 group 的真实成员。最好用一个小拓扑手工
+列出 global ranks 和 group 成员，避免读错多维 reshape 的轴顺序。
 
-相同缩写只表示研究入口，不代表可共享一套显存公式。
+模型构造和 weight loader 要按组件检查：Q/K/V/O、dense FFN、routed/shared experts、embedding、输出头、norm 与量化 metadata。通用 ParallelLinear 的规则可能被模型文件或量化路径覆盖。
 
-## 18. 阅读完成后的自检问题
+KV 需要同时读 attention backend、cache manager 和 scheduler。前者给出本地 payload，cache manager 给出 blocks 与 layout，scheduler 决定请求在哪个容量域中占用它们。
 
-在声称“已经理解某个框架的并行策略”之前，应能回答：
+Profile、warmup、Graph capture 和运行时 buffer 决定经验项的范围。无法从
+checkpoint 推导的部分，需要版本化预算或实测。
 
-1. 给定配置会启动多少个模型 workers，如何分布到机器和设备？
-2. 任意 global rank 的 TP、PP、DP、EP、CP/DCP 坐标是什么？
-3. 每个 process group 的 rank 成员是谁，它用于哪种 collective？
-4. 每个 PP stage 具体持有哪些 layers 和首尾组件？
-5. Q/K/V、FFN、experts、embedding/head、norm/scale 分别如何分片或复制？
-6. GQA/MQA 在有效 attention TP 变大时，KV head 何时开始复制？
-7. 一个请求由哪个 scheduler 管理，占用哪个 cache partition？
-8. 服务 aggregate max tokens、单分区 max tokens 和单请求 max context 分别受什么限制？
-9. Prefill、Decode、Graph capture 的峰值中，哪些显存项同时存在？
-10. 当前结论是通用实现事实、目标模型能力，还是仅有未验证代码路径？
+### 7.3 参数存在不等于组合受支持
 
-如果其中任何问题只能靠参数名字猜测，就还没有完成源码级审计。
+能力证据至少有几层：源码中有字段，validation 允许该组合，模型真正接入实现，目标 backend 有测试，目标硬件实际跑通。
 
-## 19. 术语速查
+例如某 attention backend 默认声明不支持一种 CP 路径，即使 CLI 接受 `--cp-size`，也不能据此对该模型给出显存结论。工具遇到这种组合应返回 `unsupported` 或证据不足，而不是套一个理论除数。
 
-| 术语 | 本文中的简明含义 |
+框架能力必须绑定具体版本、模型、checkpoint、backend、量化方式和 topology。
+
+## 8. 术语速查与后续文档
+
+| 术语 | 本文含义 |
 | --- | --- |
-| worker | 执行模型计算并在设备上持有显存的逻辑单元 |
-| rank | worker/process 在某通信域或并行维度中的编号 |
-| world | 参与一组分布式初始化的全部 ranks |
-| process group | world 的 rank 子集，用于特定 collective |
-| TP | 沿 tensor/head/hidden 等维度切同一层 |
-| PP | 沿模型层切成多个 pipeline stages |
-| DP | 将请求分给模型副本或框架定义的数据并行域 |
-| EP | 在 ranks 间放置 routed experts 并路由 token |
-| CP | 沿 sequence/context/token 维进行协作的策略总称 |
-| DCP | 面向 Decode context/KV 的并行策略，具体语义依实现 |
-| scheduler | 决定请求何时运行、如何组成 batch 的组件 |
-| cache partition | 一组请求可以分配 KV/cache 的资源边界 |
-| page/block | cache 分配的固定粒度 |
-| Prefill | 处理 prompt 并建立初始 KV 的阶段 |
-| Decode | 读取历史 KV 并逐步生成新 token 的阶段 |
-| chunked prefill | 将长 prompt 拆成多个较小 forward chunks |
-| CUDA Graph | 捕获固定 shape GPU 工作以供后续 replay 的机制 |
-| activation | forward 中间张量 |
-| workspace | kernel、通信或转换操作使用的辅助显存 |
-| PD | 将 Prefill 和 Decode 部署到不同部署组 |
+| device ledger | 汇总一张物理设备上所有相关进程和阶段 allocation 的账本 |
+| worker | 执行模型计算的逻辑单元 |
+| rank | worker/process 在 world、group 或并行维度中的编号 |
+| world | 参与一次分布式初始化的 ranks |
+| process group | 为某种通信建立的 rank 子集 |
+| TP | 沿 tensor、head 或 hidden 维切同一层 |
+| PP | 沿模型层切成 pipeline stages |
+| 普通 DP | 复制完整模型执行域并分配请求 |
+| 组件级 DP | 只有部分模型组件或请求域使用 DP 语义 |
+| EP | 放置 routed experts，并在 ranks 间路由 token |
+| CP | 沿 token、sequence 或 context 维协作的策略总称 |
+| DCP | 面向 Decode context 的并行路径，具体语义依实现 |
+| capacity domain | 一组请求共同竞争 cache blocks 的边界 |
+| KV pool resident | 已向设备分配并常驻的 KV pool 字节数 |
+| occupied blocks | 请求当前从 KV pool 占用的 blocks |
+| raw peak | 某阶段真实共存 allocation 的峰值，不含人为安全余量 |
+| safety margin | 从可用容量中预留的判定空间，不是 allocation |
+| Graph resident | Capture 后继续保留的 Graph pool 或静态 buffer |
+| capture transient | 仅在 Graph capture 期间存在的临时 allocation |
+| Prefill | 处理 prompt 并建立初始 KV |
+| Decode | 读取历史 KV 并生成后续 token |
+| chunked prefill | 将长 prompt 拆成多次 Prefill forward |
+| PD | 将 Prefill 与 Decode 放到两个部署组 |
 
-本文提供的是阅读工具，而不是目标框架的最终结论。版本相关事实应以相应的 vLLM、SGLang exact-tag 源码审计文档为准。
+接下来可阅读版本化审计：
+
+- [vLLM v0.25.0 并行策略源码审计](./2026-07-13-vllm-v0.25.0-parallelism-source-audit.md)
+- [SGLang v0.5.15 并行策略源码审计](./2026-07-12-sglang-v0.5.15-parallelism-source-audit.md)
+- [vLLM 与 SGLang 并行策略异同](./2026-07-12-vllm-sglang-parallelism-comparison.md)
+
+框架审计中的结论以 exact tag 源码为准。
