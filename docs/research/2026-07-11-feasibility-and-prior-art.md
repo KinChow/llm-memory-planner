@@ -516,7 +516,9 @@ otherwise                                     => 可能运行，需要实测
 
 ### 11.5 已确认的框架、并行和容量口径
 
-2026-07-11 方案讨论确认，首版要求显式指定框架版本，并锁定当日最新稳定 release：vLLM `v0.24.0`、SGLang `v0.5.15`。不以动态“最新版”解析已有配置，也不兼容更早 release；平台分支使用独立的已适配发行版本。
+2026-07-11 方案讨论最初将基线锁定为 vLLM `v0.24.0`、SGLang `v0.5.15`。2026-07-13 需求 v2.0 已将当前 MVP 基线升级为 vLLM `v0.25.0`、SGLang `v0.5.15`。仍不以动态“最新版”解析已有配置，也不兼容旧 release；框架升级必须重新建立版本化默认值、兼容性、校准和命令 adapter。
+
+已有 vLLM `v0.24.0` 审计是历史差异基线，不证明 `v0.25.0` 行为。任何 rank/group、PCP/DCP/EP、Graph、KV cache、模型/backend 支持或命令参数结论，都必须在 `v0.25.0` 固定 tag 上重新核验后才能进入实现。
 
 “权重可放置”和“目标服务配置可启动”独立判断。服务启动必须包含目标 KV/latent/indexer/state cache pool、CUDA/XPU Graph、activation、runtime、allocator、通信和安全余量；max-token 容量在权重放置后按整个服务、每副本或调度分区、单请求三个层级展示。
 
@@ -530,7 +532,7 @@ PD 部署的 Prefill、Decode 池分别展示并判定显存、缓存 tokens 和
 
 ### 11.6 已确认的 MVP 平台范围
 
-2026-07-11 方案讨论确认，MVP 只打通 NVIDIA/CUDA 路径，框架基线仍为 vLLM `v0.24.0`、SGLang `v0.5.15`。H20 是首要校准与真实机器验收平台；其他 NVIDIA GPU 仅在具有适用证据时标记为支持。
+MVP 只打通 NVIDIA/CUDA 路径；2026-07-13 当前框架基线为 vLLM `v0.25.0`、SGLang `v0.5.15`。H20 是首要校准与真实机器验收平台；其他 NVIDIA GPU 仅在具有适用证据时标记为支持。
 
 P800、其他 XPU/NPU 平台、平台分支命令/镜像、XPU Graph、XCCL 显存校准以及 NVIDIA/P800 异构 PD 均延后到后续版本，不属于 MVP 交付和验收条件。此前 P800 源码与可行性审计作为未来设计输入保留，但不得被解释为 MVP 已支持。
 
